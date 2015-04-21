@@ -1,3 +1,7 @@
+/*
+	date: 2015-04-21
+	author: xjdrew
+*/
 package main
 
 import (
@@ -6,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/syslog"
 	"net"
 	"os"
 	"strconv"
@@ -21,10 +26,13 @@ var (
 )
 
 var (
+	mode          *string
+	debug         *bool
 	serverIp      = net.ParseIP("0.0.0.0").To4()
 	sockAddr      syscall.SockaddrInet4
 	alarmLogger   *log.Logger
 	blockedLogger *log.Logger
+	normalLogger  *log.Logger
 	stateEngine   map[string][]int
 )
 
@@ -48,6 +56,24 @@ func init() {
 	stateEngine = make(map[string][]int)
 }
 
+func createLogger(extra io.Writer) *log.Logger {
+	var writers []io.Writer
+	if *debug {
+		writers = append(writers, io.Writer(os.Stderr))
+	}
+
+	if extra != nil {
+		writers = append(writers, extra)
+	}
+
+	if len(writers) > 0 {
+		return log.New(io.MultiWriter(writers...), "", log.Ldate|log.Lmicroseconds)
+	} else {
+		return nil
+	}
+
+}
+
 func logAlarm(format string, a ...interface{}) {
 	if alarmLogger == nil {
 		return
@@ -60,6 +86,17 @@ func logBlocked(format string, a ...interface{}) {
 		return
 	}
 	blockedLogger.Printf(format, a...)
+}
+
+func logNormal(exit bool, format string, a ...interface{}) {
+	if normalLogger != nil {
+		normalLogger.Printf(format, a...)
+	} else {
+		log.Printf(format, a...)
+	}
+	if exit {
+		os.Exit(1)
+	}
 }
 
 // if port is in used
@@ -161,11 +198,29 @@ func reportPacketType(flags uint8) *string {
 	}
 }
 
+func runExternalCommand(ip string, port int) {
+	if cfgKillRoute == "" && cfgKillRunCmd == "" {
+		return
+	}
+	go func(ip string, port int) {
+		if cfgKillRoute != "" {
+			if err := runCmd(cfgKillRoute, ip, port); err != nil {
+				logNormal(false, "run kill_route:%s, host:%s:%d failed:%s", cfgKillRoute, ip, port, err.Error())
+			}
+		}
+		if cfgKillRunCmd != "" {
+			if err := runCmd(cfgKillRunCmd, ip, port); err != nil {
+				logNormal(false, "run kill_run_cmd:%s, host:%s:%d failed:%s", cfgKillRunCmd, ip, port, err.Error())
+			}
+		}
+	}(ip, port)
+}
+
 // tcp guard
 func tcpGuard() {
 	conn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: serverIp})
 	if err != nil {
-		log.Fatal(err)
+		logNormal(true, err.Error())
 	}
 
 	buf := make([]byte, 1024)
@@ -213,8 +268,8 @@ func tcpGuard() {
 			*reportPacketType(tcp.Ctrl), ipString, port)
 		if checkStateEngine(ipString, port) {
 			logBlocked("Host: %s Port: %d TCP Blocked", ipString, port)
-			// kill route
-			// kill run cmd
+			// run extern command
+			runExternalCommand(ipString, port)
 		}
 	}
 }
@@ -240,11 +295,11 @@ func parseToken(line string) (token, value string) {
 func parseInt(lineno int, token string, value string) int {
 	v, err := strconv.Atoi(value)
 	if err != nil {
-		log.Fatalf("line %d:%s, convert %s to int failed:%s", lineno, token, value, err.Error())
+		logNormal(true, "line %d:%s, convert %s to int failed:%s", lineno, token, value, err.Error())
 	}
 
 	if v < 0 {
-		log.Fatalf("line %d:%s, invalid value:%d", lineno, token, v)
+		logNormal(true, "line %d:%s, invalid value:%d", lineno, token, v)
 	}
 	return v
 }
@@ -256,7 +311,7 @@ func parseIp(lineno int, token string, value string) *net.IPNet {
 	}
 	_, ipNet, err := net.ParseCIDR(formalValue)
 	if err != nil {
-		log.Fatalf("line %d:%s, %s is not a legal CIDR notation ip address:%s", lineno, token, value, err.Error())
+		logNormal(true, "line %d:%s, %s is not a legal CIDR notation ip address:%s", lineno, token, value, err.Error())
 	}
 	return ipNet
 }
@@ -264,7 +319,7 @@ func parseIp(lineno int, token string, value string) *net.IPNet {
 func parseFile(lineno int, token string, value string) io.Writer {
 	f, err := os.OpenFile(value, os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
-		log.Fatalf("line %d:%s, open file %s failed:%s", lineno, token, value, err.Error())
+		logNormal(true, "line %d:%s, open file %s failed:%s", lineno, token, value, err.Error())
 	}
 	return f
 }
@@ -272,7 +327,7 @@ func parseFile(lineno int, token string, value string) io.Writer {
 func readConfigFile(file string) {
 	f, err := os.Open(file)
 	if err != nil {
-		log.Fatalf("open file %s failed: %s", file, err.Error())
+		logNormal(true, "open file %s failed: %s", file, err.Error())
 	}
 	defer f.Close()
 
@@ -332,17 +387,15 @@ func configGuard() {
 	// add local interface addresses to ignored list
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		log.Fatalf("query system network interface addresses failed:%s", err.Error())
+		logNormal(true, "query system network interface addresses failed:%s", err.Error())
 	}
 
 	for _, addr := range addrs {
-		log.Printf("++ %s:%s", addr.Network(), addr.String())
 		if addr.Network() == "ip+net" {
 			str := strings.Split(addr.String(), "/")[0]
 			if ip := net.ParseIP(str); ip != nil {
 				if ip = ip.To4(); ip != nil {
 					if !isIgnoredIP(ip) {
-						log.Printf("%s:%s", addr.Network(), addr.String())
 						cfgIgnoreIps = append(cfgIgnoreIps, &net.IPNet{
 							IP:   ip,
 							Mask: net.CIDRMask(32, 32),
@@ -354,46 +407,36 @@ func configGuard() {
 	}
 
 	// set logger
-	if cfgAlarmLog != nil {
-		alarmLogger = log.New(cfgAlarmLog, "", log.Ldate|log.Lmicroseconds)
-	} else {
-		alarmLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
+	if alarmLogger = createLogger(cfgAlarmLog); alarmLogger == nil {
+		logNormal(false, "WARNING no alarm log")
 	}
 
-	if cfgBlockedLog != nil {
-		blockedLogger = log.New(cfgBlockedLog, "", log.Ldate|log.Lmicroseconds)
-	} else {
-		blockedLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
+	if blockedLogger = createLogger(cfgBlockedLog); blockedLogger == nil {
+		logNormal(false, "WARNING no blocked log")
 	}
 }
 
 func configEcho() {
-	log.Print("+++++++++++++ config echo +++++++++++++")
-	log.Printf("+ monitor port range[%d, %d]", cfgMinPort, cfgMaxPort)
+	logNormal(false, "+++++++++++++ config echo +++++++++++++")
+	logNormal(false, "debug: %v", *debug)
+	logNormal(false, "mode: %s", *mode)
+	logNormal(false, "+ monitor port range[%d, %d]", cfgMinPort, cfgMaxPort)
 	var ports []string
 	for port := range cfgExcludePorts {
 		ports = append(ports, strconv.Itoa(port))
 	}
 
-	log.Printf("+ exclude ports:%s", strings.Join(ports, ","))
-	log.Print("+ ignore ip:")
+	logNormal(false, "+ exclude ports:%s", strings.Join(ports, ","))
+	logNormal(false, "+ ignore ip:")
 	for _, network := range cfgIgnoreIps {
-		log.Print(network.String())
+		logNormal(false, "\t%s", network.String())
 	}
-	log.Printf("+ scan trigger:%d", cfgScanTrigger)
-	log.Printf("+ kill route:%q", cfgKillRoute)
-	log.Printf("+ kill run cmd:%q", cfgKillRunCmd)
-	path := "stderr"
-	if cfgAlarmLogPath != "" {
-		path = cfgAlarmLogPath
-	}
-	log.Printf("+ alarm log file:%q", path)
-	path = "stderr"
-	if cfgBlockedLogPath != "" {
-		path = cfgBlockedLogPath
-	}
-	log.Printf("+ blocked log file:%q", path)
-	log.Print("++++++++++++++++++ end ++++++++++++++++")
+	logNormal(false, "+ scan trigger:%d", cfgScanTrigger)
+	logNormal(false, "+ kill route:%q", cfgKillRoute)
+	logNormal(false, "+ kill run cmd:%q", cfgKillRunCmd)
+	logNormal(false, "+ alarm log file:%q", cfgAlarmLogPath)
+	logNormal(false, "+ blocked log file:%q", cfgBlockedLogPath)
+	logNormal(false, "++++++++++++++++++ end ++++++++++++++++")
 }
 
 func usage() {
@@ -403,9 +446,20 @@ func usage() {
 }
 
 func main() {
-	mode := flag.String("m", "tcp", "portguard work mode: tcp or udp")
+	mode = flag.String("m", "tcp", "portguard work mode: tcp or udp")
+	debug = flag.Bool("d", false, "debug mode, print log to stderr")
 	flag.Usage = usage
 	flag.Parse()
+
+	if *debug {
+		normalLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
+	} else {
+		var err error
+		if normalLogger, err = syslog.NewLogger(syslog.LOG_ERR|syslog.LOG_LOCAL7, log.Ldate|log.Lmicroseconds); err != nil {
+			logNormal(true, "open syslog failed:%s", err.Error())
+		}
+	}
+
 	args := flag.Args()
 	if len(args) > 0 {
 		readConfigFile(args[0])

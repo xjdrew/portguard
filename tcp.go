@@ -1,4 +1,9 @@
 /*
+	this file origins from: https://github.com/grahamking/latency/blob/master/tcp.go
+	and I modify a little as need;
+*/
+
+/*
 Copyright 2013-2014 Graham King
 
 This program is free software: you can redistribute it and/or modify
