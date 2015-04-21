@@ -4,11 +4,28 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"syscall"
 )
 
-var serverIp = net.ParseIP("0.0.0.0")
+var (
+	tcpPacketTypeNull    string = "TCP NULL scan"
+	tcpPacketTypeXMAS    string = "TCP XMAS scan"
+	tcpPacketTypeSYN     string = "TCP SYN/Normal scan"
+	tcpPacketTypeUnknown string = "Unknown Type: TCP Packet Flags(FIN,SYN,RST,PSH,ACK,URG): %d"
+)
+
+var (
+	sockAddr syscall.SockaddrInet4
+	serverIp = net.ParseIP("0.0.0.0").To4()
+)
+
+func init() {
+	copy(sockAddr.Addr[:], serverIp[:])
+}
 
 // if port is in used
+// golang auto set SO_REUSEADDR when listen a port
+/*
 func smartVerifyTCP(port int) bool {
 	addr := &net.TCPAddr{
 		IP:   serverIp,
@@ -21,56 +38,74 @@ func smartVerifyTCP(port int) bool {
 	ln.Close()
 	return false
 }
+*/
 
-func reportPacketType(flags uint8) string {
-	if flags == 0 {
-		return "TCP NULL scan"
-	} else if flags&(FIN|URG|PSH) == (FIN | URG | PSH) {
-		return "TCP XMAS scan"
-	} else if flags == SYN {
-		return "TCP SYN/Normal scan"
-	} else {
-		return fmt.Sprintf("Unknown Type: TCP Packet Flags(FIN,SYN,RST,PSH,ACK,URG): %d", flags)
-	}
-}
-
-func filterPacket(addr net.Addr, data []byte) {
-	tcp := NewTCPHeader(data)
-	// portsentry: check for an ACK/RST to weed out established connections in case the user
-	// is monitoring high ephemeral port numbers
-	if tcp.HasFlag(RST) || tcp.HasFlag(ACK) {
-		return
-	}
-
-	port := tcp.Destination
-	if smartVerifyTCP(int(port)) {
-		return
-	}
-	log.Printf("attackalert: %s from host: %s to TCP port: %d",
-		reportPacketType(tcp.Ctrl), addr.String(), port)
-}
-
-func main() {
-	netProto := "ip4:tcp"
-	addr, err := net.ResolveIPAddr(netProto, "0.0.0.0")
+func smartVerifyTCP(port int) bool {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		log.Fatal(err)
+		return false
 	}
+	sockAddr.Port = port
+	err = syscall.Bind(fd, &sockAddr)
+	syscall.Close(fd)
+	if err != nil {
+		return true
+	}
+	return false
+}
 
+func reportPacketType(flags uint8) *string {
+	if flags == 0 {
+		return &tcpPacketTypeNull
+	} else if flags&(FIN|URG|PSH) == (FIN | URG | PSH) {
+		return &tcpPacketTypeXMAS
+	} else if flags == SYN {
+		return &tcpPacketTypeSYN
+	} else {
+		packetType := fmt.Sprintf(tcpPacketTypeUnknown, flags)
+		return &packetType
+	}
+}
+
+// tcp guard
+func tcpGuard() {
 	buf := make([]byte, 1024)
+	var tcp TCPHeader
 	for {
-		conn, err := net.ListenIP(netProto, addr)
+		conn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: serverIp})
 		if err != nil {
 			log.Print(err)
 			continue
 		}
 
 		numRead, remoteAddr, err := conn.ReadFrom(buf)
+		// close immedately
 		conn.Close()
 		if err != nil {
 			continue
 		}
 
-		filterPacket(remoteAddr, buf[:numRead])
+		NewTCPHeader(buf[:numRead], &tcp)
+		/*nmap: Page 65 of RFC 793 says that “if the [destination] port state is
+		CLOSED .... an incoming segment not containing a RST causes a RST to be
+		sent in response.”  Then the next page discusses packets sent to open
+		ports without the SYN, RST, or ACK bits set, stating that: “you are
+		unlikely to get here, but if you do, drop the segment, and return.”
+		*/
+		if tcp.HasFlag(RST) || tcp.HasFlag(ACK) {
+			continue
+		}
+
+		port := tcp.Destination
+		log.Printf("port %d, flags:%d", port, tcp.Ctrl)
+		if smartVerifyTCP(int(port)) {
+			continue
+		}
+		log.Printf("attackalert: %s from host: %s to TCP port: %d",
+			*reportPacketType(tcp.Ctrl), remoteAddr.String(), port)
 	}
+}
+
+func main() {
+	tcpGuard()
 }

@@ -52,8 +52,7 @@ type TCPOption struct {
 }
 
 // Parse packet into TCPHeader structure
-func NewTCPHeader(data []byte) *TCPHeader {
-	var tcp TCPHeader
+func NewTCPHeader(data []byte, tcp *TCPHeader) *TCPHeader {
 	r := bytes.NewReader(data)
 	binary.Read(r, binary.BigEndian, &tcp.Source)
 	binary.Read(r, binary.BigEndian, &tcp.Destination)
@@ -71,7 +70,7 @@ func NewTCPHeader(data []byte) *TCPHeader {
 	binary.Read(r, binary.BigEndian, &tcp.Checksum)
 	binary.Read(r, binary.BigEndian, &tcp.Urgent)
 
-	return &tcp
+	return tcp
 }
 
 func (tcp *TCPHeader) HasFlag(flagBit byte) bool {
