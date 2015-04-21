@@ -4,5 +4,5 @@ portguard is inspired by portsentry, and is similar with [portsentry](http://sou
 
 It's written by golang, and the code base is much smaller than portsentry, so you can customize portguard easily as need;
 
-And besides that, portguard implement more features.
+And besides that, portguard's stateEngine is more powerful, it's easy to implement more detection rules.
 
