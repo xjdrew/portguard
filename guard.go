@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -15,12 +21,45 @@ var (
 )
 
 var (
-	sockAddr syscall.SockaddrInet4
-	serverIp = net.ParseIP("0.0.0.0").To4()
+	serverIp      = net.ParseIP("0.0.0.0").To4()
+	sockAddr      syscall.SockaddrInet4
+	alarmLogger   *log.Logger
+	blockedLogger *log.Logger
+	stateEngine   map[string][]int
+)
+
+var (
+	cfgMinPort        int = 0
+	cfgMaxPort        int = 65535
+	cfgExcludePorts   map[int]bool
+	cfgIgnoreIps      []*net.IPNet
+	cfgKillRoute      string = ""
+	cfgKillRunCmd     string = ""
+	cfgScanTrigger    int    = 0
+	cfgAlarmLogPath   string
+	cfgAlarmLog       io.Writer
+	cfgBlockedLog     io.Writer
+	cfgBlockedLogPath string
 )
 
 func init() {
 	copy(sockAddr.Addr[:], serverIp[:])
+	cfgExcludePorts = make(map[int]bool)
+	stateEngine = make(map[string][]int)
+}
+
+func logAlarm(format string, a ...interface{}) {
+	if alarmLogger == nil {
+		return
+	}
+	alarmLogger.Printf(format, a...)
+}
+
+func logBlocked(format string, a ...interface{}) {
+	if blockedLogger == nil {
+		return
+	}
+	blockedLogger.Printf(format, a...)
 }
 
 // if port is in used
@@ -54,6 +93,61 @@ func smartVerifyTCP(port int) bool {
 	return false
 }
 
+func isExlcudePorts(port int) bool {
+	_, ok := cfgExcludePorts[port]
+	return ok
+}
+
+func isIgnoredIP(ip net.IP) bool {
+	if cfgExcludePorts == nil {
+		return false
+	}
+	for _, n := range cfgIgnoreIps {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// cfgScanTrigger + 2 times scan
+func isBlockedIP(ip string) bool {
+	ports, ok := stateEngine[ip]
+	if !ok {
+		return false
+	}
+
+	if len(ports) > cfgScanTrigger {
+		return true
+	}
+	return false
+}
+
+// true if trigger blocked
+func checkStateEngine(ip string, port int) bool {
+	ports, ok := stateEngine[ip]
+	sz := cfgScanTrigger + 1
+	if !ok {
+		ports = make([]int, sz)[:0]
+	}
+	if len(ports) >= sz {
+		return true
+	}
+
+	for _, v := range ports {
+		if v == port {
+			return false
+		}
+	}
+
+	ports = append(ports, port)
+	stateEngine[ip] = ports
+	if len(ports) >= sz {
+		return true
+	}
+	return false
+}
+
 func reportPacketType(flags uint8) *string {
 	if flags == 0 {
 		return &tcpPacketTypeNull
@@ -69,22 +163,18 @@ func reportPacketType(flags uint8) *string {
 
 // tcp guard
 func tcpGuard() {
+	conn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: serverIp})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	buf := make([]byte, 1024)
 	var tcp TCPHeader
 	for {
-		conn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: serverIp})
-		if err != nil {
-			log.Print(err)
-			continue
-		}
-
-		numRead, remoteAddr, err := conn.ReadFrom(buf)
-		// close immedately
-		conn.Close()
+		numRead, remoteAddr, err := conn.ReadFromIP(buf)
 		if err != nil {
 			continue
 		}
-
 		NewTCPHeader(buf[:numRead], &tcp)
 		/*nmap: Page 65 of RFC 793 says that “if the [destination] port state is
 		CLOSED .... an incoming segment not containing a RST causes a RST to be
@@ -96,16 +186,238 @@ func tcpGuard() {
 			continue
 		}
 
-		port := tcp.Destination
-		log.Printf("port %d, flags:%d", port, tcp.Ctrl)
-		if smartVerifyTCP(int(port)) {
+		port := int(tcp.Destination)
+		ip := remoteAddr.IP
+		ipString := ip.String()
+		// check port range
+		if port < cfgMinPort || port > cfgMaxPort {
 			continue
 		}
-		log.Printf("attackalert: %s from host: %s to TCP port: %d",
-			*reportPacketType(tcp.Ctrl), remoteAddr.String(), port)
+
+		// if blocked before
+		if isBlockedIP(ipString) {
+			continue
+		}
+
+		// check ignore ip
+		if isIgnoredIP(ip) {
+			continue
+		}
+
+		// verify port usage
+		if smartVerifyTCP(port) {
+			continue
+		}
+
+		logAlarm("attackalert: %s from host: %s to TCP port: %d",
+			*reportPacketType(tcp.Ctrl), ipString, port)
+		if checkStateEngine(ipString, port) {
+			logBlocked("Host: %s Port: %d TCP Blocked", ipString, port)
+			// kill route
+			// kill run cmd
+		}
 	}
 }
 
+func udpGuard() {
+	fmt.Fprintf(os.Stderr, "udp port guard is not implemented now, but will come soon\n")
+}
+
+func parseToken(line string) (token, value string) {
+	line = strings.TrimRight(line, "\r\n")
+	tokens := strings.SplitN(line, "=", 2)
+	if len(tokens) != 2 {
+		return
+	}
+	value = strings.TrimSpace(tokens[1])
+	if value == "" {
+		return
+	}
+	token = strings.TrimSpace(tokens[0])
+	return
+}
+
+func parseInt(lineno int, token string, value string) int {
+	v, err := strconv.Atoi(value)
+	if err != nil {
+		log.Fatalf("line %d:%s, convert %s to int failed:%s", lineno, token, value, err.Error())
+	}
+
+	if v < 0 {
+		log.Fatalf("line %d:%s, invalid value:%d", lineno, token, v)
+	}
+	return v
+}
+
+func parseIp(lineno int, token string, value string) *net.IPNet {
+	formalValue := value
+	if !strings.Contains(value, "/") {
+		formalValue = fmt.Sprintf("%s/%d", value, 32)
+	}
+	_, ipNet, err := net.ParseCIDR(formalValue)
+	if err != nil {
+		log.Fatalf("line %d:%s, %s is not a legal CIDR notation ip address:%s", lineno, token, value, err.Error())
+	}
+	return ipNet
+}
+
+func parseFile(lineno int, token string, value string) io.Writer {
+	f, err := os.OpenFile(value, os.O_APPEND|os.O_CREATE, 0666)
+	if err != nil {
+		log.Fatalf("line %d:%s, open file %s failed:%s", lineno, token, value, err.Error())
+	}
+	return f
+}
+
+func readConfigFile(file string) {
+	f, err := os.Open(file)
+	if err != nil {
+		log.Fatalf("open file %s failed: %s", file, err.Error())
+	}
+	defer f.Close()
+
+	rd := bufio.NewReader(f)
+	lineno := 0
+	for {
+		line, err := rd.ReadString('\n')
+		lineno++
+
+		if !strings.HasPrefix(line, "#") {
+			token, value := parseToken(line)
+			switch token {
+			case "min_port":
+				cfgMinPort = parseInt(lineno, token, value)
+			case "max_port":
+				cfgMaxPort = parseInt(lineno, token, value)
+			case "exclude_ports":
+				port := parseInt(lineno, token, value)
+				cfgExcludePorts[port] = true
+			case "ignore_ip":
+				ipNet := parseIp(lineno, token, value)
+				cfgIgnoreIps = append(cfgIgnoreIps, ipNet)
+			case "kill_route":
+				cfgKillRoute = value
+			case "kill_run_cmd":
+				cfgKillRunCmd = value
+			case "scan_trigger":
+				cfgScanTrigger = parseInt(lineno, token, value)
+			case "alarm_log":
+				cfgAlarmLogPath = value
+				cfgAlarmLog = parseFile(lineno, token, value)
+			case "blocked_log":
+				cfgBlockedLogPath = value
+				cfgBlockedLog = parseFile(lineno, token, value)
+			default:
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
+func configGuard() {
+	// add default ignore network
+	defaultIgnoreNetwork := []string{
+		"127.0.0.1/8",
+	}
+	for _, network := range defaultIgnoreNetwork {
+		_, ipNet, err := net.ParseCIDR(network)
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfgIgnoreIps = append(cfgIgnoreIps, ipNet)
+	}
+
+	// add local interface addresses to ignored list
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Fatalf("query system network interface addresses failed:%s", err.Error())
+	}
+
+	for _, addr := range addrs {
+		log.Printf("++ %s:%s", addr.Network(), addr.String())
+		if addr.Network() == "ip+net" {
+			str := strings.Split(addr.String(), "/")[0]
+			if ip := net.ParseIP(str); ip != nil {
+				if ip = ip.To4(); ip != nil {
+					if !isIgnoredIP(ip) {
+						log.Printf("%s:%s", addr.Network(), addr.String())
+						cfgIgnoreIps = append(cfgIgnoreIps, &net.IPNet{
+							IP:   ip,
+							Mask: net.CIDRMask(32, 32),
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// set logger
+	if cfgAlarmLog != nil {
+		alarmLogger = log.New(cfgAlarmLog, "", log.Ldate|log.Lmicroseconds)
+	} else {
+		alarmLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
+	}
+
+	if cfgBlockedLog != nil {
+		blockedLogger = log.New(cfgBlockedLog, "", log.Ldate|log.Lmicroseconds)
+	} else {
+		blockedLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
+	}
+}
+
+func configEcho() {
+	log.Print("+++++++++++++ config echo +++++++++++++")
+	log.Printf("+ monitor port range[%d, %d]", cfgMinPort, cfgMaxPort)
+	var ports []string
+	for port := range cfgExcludePorts {
+		ports = append(ports, strconv.Itoa(port))
+	}
+
+	log.Printf("+ exclude ports:%s", strings.Join(ports, ","))
+	log.Print("+ ignore ip:")
+	for _, network := range cfgIgnoreIps {
+		log.Print(network.String())
+	}
+	log.Printf("+ scan trigger:%d", cfgScanTrigger)
+	log.Printf("+ kill route:%q", cfgKillRoute)
+	log.Printf("+ kill run cmd:%q", cfgKillRunCmd)
+	path := "stderr"
+	if cfgAlarmLogPath != "" {
+		path = cfgAlarmLogPath
+	}
+	log.Printf("+ alarm log file:%q", path)
+	path = "stderr"
+	if cfgBlockedLogPath != "" {
+		path = cfgBlockedLogPath
+	}
+	log.Printf("+ blocked log file:%q", path)
+	log.Print("++++++++++++++++++ end ++++++++++++++++")
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, "usage: %s [configFile]\n", os.Args[0])
+	flag.PrintDefaults()
+	os.Exit(1)
+}
+
 func main() {
-	tcpGuard()
+	mode := flag.String("m", "tcp", "portguard work mode: tcp or udp")
+	flag.Usage = usage
+	flag.Parse()
+	args := flag.Args()
+	if len(args) > 0 {
+		readConfigFile(args[0])
+	}
+	configGuard()
+	configEcho()
+
+	if *mode == "tcp" {
+		tcpGuard()
+	} else if *mode == "udp" {
+		udpGuard()
+	} else {
+		fmt.Fprintf(os.Stderr, "don't support mode: %s\n", *mode)
+	}
 }
