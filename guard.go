@@ -68,7 +68,6 @@ func createLogger(extra io.Writer) *log.Logger {
 		writers = append(writers, io.Writer(os.Stderr))
 	}
 
-	log.Print("----------------logger:", len(writers))
 	if len(writers) > 0 {
 		return log.New(io.MultiWriter(writers...), "", log.Ldate|log.Lmicroseconds)
 	} else {
@@ -433,9 +432,10 @@ func configGuard() {
 }
 
 func configEcho() {
+	logNormal(false, "+++++++++++++ portguard started +++++++++++++")
 	logNormal(false, "+++++++++++++ config echo +++++++++++++")
-	logNormal(false, "debug: %v", *debug)
-	logNormal(false, "mode: %s", *mode)
+	logNormal(false, "+ debug: %v", *debug)
+	logNormal(false, "+ mode: %s", *mode)
 	logNormal(false, "+ monitor port range[%d, %d]", cfgMinPort, cfgMaxPort)
 	var ports []string
 	for port := range cfgExcludePorts {
@@ -445,7 +445,7 @@ func configEcho() {
 	logNormal(false, "+ exclude ports:%s", strings.Join(ports, ","))
 	logNormal(false, "+ ignore ip:")
 	for _, network := range cfgIgnoreIps {
-		logNormal(false, "\t%s", network.String())
+		logNormal(false, "-%s", network.String())
 	}
 	logNormal(false, "+ scan trigger:%d", cfgScanTrigger)
 	logNormal(false, "+ kill route:%q", cfgKillRoute)
