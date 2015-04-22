@@ -58,14 +58,15 @@ func init() {
 
 func createLogger(extra io.Writer) *log.Logger {
 	var writers []io.Writer
-	if *debug {
-		writers = append(writers, io.Writer(os.Stderr))
-	}
-
 	if extra != nil {
 		writers = append(writers, extra)
 	}
 
+	if *debug {
+		writers = append(writers, io.Writer(os.Stderr))
+	}
+
+	log.Print("----------------logger:", len(writers))
 	if len(writers) > 0 {
 		return log.New(io.MultiWriter(writers...), "", log.Ldate|log.Lmicroseconds)
 	} else {
@@ -317,7 +318,7 @@ func parseIp(lineno int, token string, value string) *net.IPNet {
 }
 
 func parseFile(lineno int, token string, value string) io.Writer {
-	f, err := os.OpenFile(value, os.O_APPEND|os.O_CREATE, 0666)
+	f, err := os.OpenFile(value, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
 		logNormal(true, "line %d:%s, open file %s failed:%s", lineno, token, value, err.Error())
 	}
