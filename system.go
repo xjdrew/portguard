@@ -5,6 +5,7 @@
 package main
 
 import (
+	"net/http"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -16,4 +17,15 @@ func runCmd(script string, target string, port int) error {
 	var cmd *exec.Cmd
 	cmd = exec.Command("/bin/sh", "-c", script)
 	return cmd.Run()
+}
+
+func requestUrl(url string, target string, port int) error {
+	url = strings.Replace(url, "$TARGET$", target, -1)
+	url = strings.Replace(url, "$PORT$", strconv.Itoa(port), -1)
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }

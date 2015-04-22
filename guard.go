@@ -12,6 +12,7 @@ import (
 	"log"
 	"log/syslog"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -43,6 +44,7 @@ var (
 	cfgIgnoreIps      []*net.IPNet
 	cfgKillRoute      string = ""
 	cfgKillRunCmd     string = ""
+	cfgKillNotifyUrl  string = ""
 	cfgScanTrigger    int    = 0
 	cfgAlarmLogPath   string
 	cfgAlarmLog       io.Writer
@@ -200,7 +202,7 @@ func reportPacketType(flags uint8) *string {
 }
 
 func runExternalCommand(ip string, port int) {
-	if cfgKillRoute == "" && cfgKillRunCmd == "" {
+	if cfgKillRoute == "" && cfgKillRunCmd == "" && cfgKillNotifyUrl == "" {
 		return
 	}
 	go func(ip string, port int) {
@@ -209,9 +211,16 @@ func runExternalCommand(ip string, port int) {
 				logNormal(false, "run kill_route:%s, host:%s:%d failed:%s", cfgKillRoute, ip, port, err.Error())
 			}
 		}
+
 		if cfgKillRunCmd != "" {
 			if err := runCmd(cfgKillRunCmd, ip, port); err != nil {
 				logNormal(false, "run kill_run_cmd:%s, host:%s:%d failed:%s", cfgKillRunCmd, ip, port, err.Error())
+			}
+		}
+
+		if cfgKillNotifyUrl != "" {
+			if err := requestUrl(cfgKillNotifyUrl, ip, port); err != nil {
+				logNormal(false, "notify kill_notify_url:%s, host:%s:%d failed:%s", cfgKillNotifyUrl, ip, port, err.Error())
 			}
 		}
 	}(ip, port)
@@ -355,6 +364,11 @@ func readConfigFile(file string) {
 				cfgKillRoute = value
 			case "kill_run_cmd":
 				cfgKillRunCmd = value
+			case "kill_notify_url":
+				if _, err := url.Parse(value); err != nil {
+					logNormal(true, "line %d:%s, invalid url:%s", lineno, token, value)
+				}
+				cfgKillNotifyUrl = value
 			case "scan_trigger":
 				cfgScanTrigger = parseInt(lineno, token, value)
 			case "alarm_log":
@@ -377,6 +391,7 @@ func configGuard() {
 	defaultIgnoreNetwork := []string{
 		"127.0.0.1/8",
 	}
+
 	for _, network := range defaultIgnoreNetwork {
 		_, ipNet, err := net.ParseCIDR(network)
 		if err != nil {
@@ -435,6 +450,7 @@ func configEcho() {
 	logNormal(false, "+ scan trigger:%d", cfgScanTrigger)
 	logNormal(false, "+ kill route:%q", cfgKillRoute)
 	logNormal(false, "+ kill run cmd:%q", cfgKillRunCmd)
+	logNormal(false, "+ kill notify url:%q", cfgKillNotifyUrl)
 	logNormal(false, "+ alarm log file:%q", cfgAlarmLogPath)
 	logNormal(false, "+ blocked log file:%q", cfgBlockedLogPath)
 	logNormal(false, "++++++++++++++++++ end ++++++++++++++++")
