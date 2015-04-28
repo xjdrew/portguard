@@ -11,7 +11,8 @@ import (
 	"strings"
 )
 
-func runCmd(script string, target string, port int) error {
+func runCmd(script string, mode string, target string, port int) error {
+	script = strings.Replace(script, "$MODE$", mode, -1)
 	script = strings.Replace(script, "$TARGET$", target, -1)
 	script = strings.Replace(script, "$PORT$", strconv.Itoa(port), -1)
 	var cmd *exec.Cmd
@@ -19,7 +20,8 @@ func runCmd(script string, target string, port int) error {
 	return cmd.Run()
 }
 
-func requestUrl(url string, target string, port int) error {
+func requestUrl(url string, mode string, target string, port int) error {
+	url = strings.Replace(url, "$MODE$", mode, -1)
 	url = strings.Replace(url, "$TARGET$", target, -1)
 	url = strings.Replace(url, "$PORT$", strconv.Itoa(port), -1)
 	resp, err := http.Get(url)

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var (
@@ -27,19 +28,22 @@ var (
 )
 
 var (
-	mode          *string
-	debug         *bool
-	serverIp      = net.ParseIP("0.0.0.0").To4()
-	sockAddr      syscall.SockaddrInet4
-	alarmLogger   *log.Logger
-	blockedLogger *log.Logger
-	normalLogger  *log.Logger
-	stateEngine   map[string][]int
+	mode              *string
+	debug             *bool
+	portCacheDuration *int64 // see smartVerify for explanation
+	serverIp          = net.ParseIP("0.0.0.0").To4()
+	sockAddr          syscall.SockaddrInet4
+	alarmLogger       *log.Logger
+	blockedLogger     *log.Logger
+	mainLogger        *log.Logger
+	checkedPortCache  map[int]int64
+	stateEngine       map[string][]int
 )
 
 var (
 	cfgMinPort        int = 0
 	cfgMaxPort        int = 65535
+	cfgNoisyPorts     map[int]bool
 	cfgExcludePorts   map[int]bool
 	cfgIgnoreIps      []*net.IPNet
 	cfgKillRoute      string = ""
@@ -54,7 +58,10 @@ var (
 
 func init() {
 	copy(sockAddr.Addr[:], serverIp[:])
+	cfgNoisyPorts = make(map[int]bool)
 	cfgExcludePorts = make(map[int]bool)
+
+	checkedPortCache = make(map[int]int64)
 	stateEngine = make(map[string][]int)
 }
 
@@ -90,9 +97,9 @@ func logBlocked(format string, a ...interface{}) {
 	blockedLogger.Printf(format, a...)
 }
 
-func logNormal(exit bool, format string, a ...interface{}) {
-	if normalLogger != nil {
-		normalLogger.Printf(format, a...)
+func logMain(exit bool, format string, a ...interface{}) {
+	if mainLogger != nil {
+		mainLogger.Printf(format, a...)
 	} else {
 		log.Printf(format, a...)
 	}
@@ -102,24 +109,13 @@ func logNormal(exit bool, format string, a ...interface{}) {
 }
 
 // if port is in used
-// golang auto set SO_REUSEADDR when listen a port
-/*
-func smartVerifyTCP(port int) bool {
-	addr := &net.TCPAddr{
-		IP:   serverIp,
-		Port: port,
+// net.Listen will auto set SO_REUSEADDR when listen a port
+func smartVerifyPort(port int) bool {
+	stype := syscall.SOCK_STREAM
+	if *mode == "udp" {
+		stype = syscall.SOCK_DGRAM
 	}
-	ln, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return true
-	}
-	ln.Close()
-	return false
-}
-*/
-
-func smartVerifyTCP(port int) bool {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	fd, err := syscall.Socket(syscall.AF_INET, stype, 0)
 	if err != nil {
 		return false
 	}
@@ -132,13 +128,38 @@ func smartVerifyTCP(port int) bool {
 	return false
 }
 
+// use socket and bind api to check port is very expensive
+// if port is in use, we assume it'll be used as long as *portCacheDuration* seconds
+// so we cache the result
+func smartVerify(port int) bool {
+	if *portCacheDuration <= 0 {
+		return smartVerifyPort(port)
+	}
+
+	timestamp := time.Now().Unix()
+	if expire, ok := checkedPortCache[port]; ok {
+		if expire > timestamp {
+			logMain(false, "hit cache: %d", port)
+			return true
+		} else {
+			delete(checkedPortCache, port)
+		}
+	}
+
+	ok := smartVerifyPort(port)
+	if ok {
+		checkedPortCache[port] = timestamp + *portCacheDuration
+	}
+	return ok
+}
+
 func isExlcudePorts(port int) bool {
 	_, ok := cfgExcludePorts[port]
 	return ok
 }
 
 func isIgnoredIP(ip net.IP) bool {
-	if cfgExcludePorts == nil {
+	if cfgIgnoreIps == nil {
 		return false
 	}
 	for _, n := range cfgIgnoreIps {
@@ -206,20 +227,20 @@ func runExternalCommand(ip string, port int) {
 	}
 	go func(ip string, port int) {
 		if cfgKillRoute != "" {
-			if err := runCmd(cfgKillRoute, ip, port); err != nil {
-				logNormal(false, "run kill_route:%s, host:%s:%d failed:%s", cfgKillRoute, ip, port, err.Error())
+			if err := runCmd(cfgKillRoute, *mode, ip, port); err != nil {
+				logMain(false, "run kill_route:%s, host:%s:%d failed:%s", cfgKillRoute, ip, port, err.Error())
 			}
 		}
 
 		if cfgKillRunCmd != "" {
-			if err := runCmd(cfgKillRunCmd, ip, port); err != nil {
-				logNormal(false, "run kill_run_cmd:%s, host:%s:%d failed:%s", cfgKillRunCmd, ip, port, err.Error())
+			if err := runCmd(cfgKillRunCmd, *mode, ip, port); err != nil {
+				logMain(false, "run kill_run_cmd:%s, host:%s:%d failed:%s", cfgKillRunCmd, ip, port, err.Error())
 			}
 		}
 
 		if cfgKillNotifyUrl != "" {
-			if err := requestUrl(cfgKillNotifyUrl, ip, port); err != nil {
-				logNormal(false, "notify kill_notify_url:%s, host:%s:%d failed:%s", cfgKillNotifyUrl, ip, port, err.Error())
+			if err := requestUrl(cfgKillNotifyUrl, *mode, ip, port); err != nil {
+				logMain(false, "notify kill_notify_url:%s, host:%s:%d failed:%s", cfgKillNotifyUrl, ip, port, err.Error())
 			}
 		}
 	}(ip, port)
@@ -229,17 +250,18 @@ func runExternalCommand(ip string, port int) {
 func tcpGuard() {
 	conn, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: serverIp})
 	if err != nil {
-		logNormal(true, err.Error())
+		logMain(true, err.Error())
 	}
 
-	buf := make([]byte, 1024)
+	b := make([]byte, 1024)
 	var tcp TCPHeader
 	for {
-		numRead, remoteAddr, err := conn.ReadFromIP(buf)
+		numRead, remoteAddr, err := conn.ReadFromIP(b)
 		if err != nil {
+			logMain(false, "read from ip:%s", err.Error())
 			continue
 		}
-		NewTCPHeader(buf[:numRead], &tcp)
+		NewTCPHeader(b[:numRead], &tcp)
 		/*nmap: Page 65 of RFC 793 says that “if the [destination] port state is
 		CLOSED .... an incoming segment not containing a RST causes a RST to be
 		sent in response.”  Then the next page discusses packets sent to open
@@ -269,7 +291,7 @@ func tcpGuard() {
 		}
 
 		// verify port usage
-		if smartVerifyTCP(port) {
+		if smartVerify(port) {
 			continue
 		}
 
@@ -284,7 +306,57 @@ func tcpGuard() {
 }
 
 func udpGuard() {
-	fmt.Fprintf(os.Stderr, "udp port guard is not implemented now, but will come soon\n")
+	conn, err := net.ListenIP("ip4:udp", &net.IPAddr{IP: serverIp})
+	if err != nil {
+		logMain(true, err.Error())
+	}
+
+	b := make([]byte, 1024)
+	var udp UDPHeader
+	for {
+		numRead, remoteAddr, err := conn.ReadFromIP(b)
+		if err != nil {
+			logMain(false, "read from ip:%s", err.Error())
+			continue
+		}
+		NewUDPHeader(b[:numRead], &udp)
+		port := int(udp.Destination)
+
+		// ignore noisy port
+		if _, ok := cfgNoisyPorts[port]; ok {
+			continue
+		}
+
+		log.Printf("%v: %d->%d", remoteAddr, udp.Source, udp.Destination)
+		ip := remoteAddr.IP
+		ipString := ip.String()
+		// check port range
+		if port < cfgMinPort || port > cfgMaxPort {
+			continue
+		}
+
+		// if blocked before
+		if isBlockedIP(ipString) {
+			continue
+		}
+
+		// check ignore ip
+		if isIgnoredIP(ip) {
+			continue
+		}
+
+		// verify port usage
+		if smartVerify(port) {
+			continue
+		}
+
+		logAlarm("attackalert: UDP scan from host: %s to UDP port: %d", ipString, port)
+		if checkStateEngine(ipString, port) {
+			logBlocked("Host: %s Port: %d UDP Blocked", ipString, port)
+			// run extern command
+			runExternalCommand(ipString, port)
+		}
+	}
 }
 
 func parseToken(line string) (token, value string) {
@@ -304,11 +376,11 @@ func parseToken(line string) (token, value string) {
 func parseInt(lineno int, token string, value string) int {
 	v, err := strconv.Atoi(value)
 	if err != nil {
-		logNormal(true, "line %d:%s, convert %s to int failed:%s", lineno, token, value, err.Error())
+		logMain(true, "line %d:%s, convert %s to int failed:%s", lineno, token, value, err.Error())
 	}
 
 	if v < 0 {
-		logNormal(true, "line %d:%s, invalid value:%d", lineno, token, v)
+		logMain(true, "line %d:%s, invalid value:%d", lineno, token, v)
 	}
 	return v
 }
@@ -320,7 +392,7 @@ func parseIp(lineno int, token string, value string) *net.IPNet {
 	}
 	_, ipNet, err := net.ParseCIDR(formalValue)
 	if err != nil {
-		logNormal(true, "line %d:%s, %s is not a legal CIDR notation ip address:%s", lineno, token, value, err.Error())
+		logMain(true, "line %d:%s, %s is not a legal CIDR notation ip address:%s", lineno, token, value, err.Error())
 	}
 	return ipNet
 }
@@ -328,7 +400,7 @@ func parseIp(lineno int, token string, value string) *net.IPNet {
 func parseFile(lineno int, token string, value string) io.Writer {
 	f, err := os.OpenFile(value, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
-		logNormal(true, "line %d:%s, open file %s failed:%s", lineno, token, value, err.Error())
+		logMain(true, "line %d:%s, open file %s failed:%s", lineno, token, value, err.Error())
 	}
 	return f
 }
@@ -336,7 +408,7 @@ func parseFile(lineno int, token string, value string) io.Writer {
 func readConfigFile(file string) {
 	f, err := os.Open(file)
 	if err != nil {
-		logNormal(true, "open file %s failed: %s", file, err.Error())
+		logMain(true, "open file %s failed: %s", file, err.Error())
 	}
 	defer f.Close()
 
@@ -353,7 +425,10 @@ func readConfigFile(file string) {
 				cfgMinPort = parseInt(lineno, token, value)
 			case "max_port":
 				cfgMaxPort = parseInt(lineno, token, value)
-			case "exclude_ports":
+			case "noisy_udp_port":
+				port := parseInt(lineno, token, value)
+				cfgNoisyPorts[port] = true
+			case "exclude_port":
 				port := parseInt(lineno, token, value)
 				cfgExcludePorts[port] = true
 			case "ignore_ip":
@@ -365,7 +440,7 @@ func readConfigFile(file string) {
 				cfgKillRunCmd = value
 			case "kill_notify_url":
 				if _, err := url.Parse(value); err != nil {
-					logNormal(true, "line %d:%s, invalid url:%s", lineno, token, value)
+					logMain(true, "line %d:%s, invalid url:%s", lineno, token, value)
 				}
 				cfgKillNotifyUrl = value
 			case "scan_trigger":
@@ -402,7 +477,7 @@ func configGuard() {
 	// add local interface addresses to ignored list
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		logNormal(true, "query system network interface addresses failed:%s", err.Error())
+		logMain(true, "query system network interface addresses failed:%s", err.Error())
 	}
 
 	for _, addr := range addrs {
@@ -423,37 +498,37 @@ func configGuard() {
 
 	// set logger
 	if alarmLogger = createLogger(cfgAlarmLog); alarmLogger == nil {
-		logNormal(false, "WARNING no alarm log")
+		logMain(false, "WARNING no alarm log")
 	}
 
 	if blockedLogger = createLogger(cfgBlockedLog); blockedLogger == nil {
-		logNormal(false, "WARNING no blocked log")
+		logMain(false, "WARNING no blocked log")
 	}
 }
 
 func configEcho() {
-	logNormal(false, "+++++++++++++ portguard started +++++++++++++")
-	logNormal(false, "+++++++++++++ config echo +++++++++++++")
-	logNormal(false, "+ debug: %v", *debug)
-	logNormal(false, "+ mode: %s", *mode)
-	logNormal(false, "+ monitor port range[%d, %d]", cfgMinPort, cfgMaxPort)
+	logMain(false, "+++++++++++++ portguard started +++++++++++++")
+	logMain(false, "+++++++++++++ config +++++++++++++")
+	logMain(false, "+ debug: %v", *debug)
+	logMain(false, "+ mode: %s", *mode)
+	logMain(false, "+ monitor port range[%d, %d]", cfgMinPort, cfgMaxPort)
 	var ports []string
 	for port := range cfgExcludePorts {
 		ports = append(ports, strconv.Itoa(port))
 	}
 
-	logNormal(false, "+ exclude ports:%s", strings.Join(ports, ","))
-	logNormal(false, "+ ignore ip:")
+	logMain(false, "+ exclude ports:%s", strings.Join(ports, ","))
+	logMain(false, "+ ignore ip:")
 	for _, network := range cfgIgnoreIps {
-		logNormal(false, "-%s", network.String())
+		logMain(false, "-%s", network.String())
 	}
-	logNormal(false, "+ scan trigger:%d", cfgScanTrigger)
-	logNormal(false, "+ kill route:%q", cfgKillRoute)
-	logNormal(false, "+ kill run cmd:%q", cfgKillRunCmd)
-	logNormal(false, "+ kill notify url:%q", cfgKillNotifyUrl)
-	logNormal(false, "+ alarm log file:%q", cfgAlarmLogPath)
-	logNormal(false, "+ blocked log file:%q", cfgBlockedLogPath)
-	logNormal(false, "++++++++++++++++++ end ++++++++++++++++")
+	logMain(false, "+ scan trigger:%d", cfgScanTrigger)
+	logMain(false, "+ kill route:%q", cfgKillRoute)
+	logMain(false, "+ kill run cmd:%q", cfgKillRunCmd)
+	logMain(false, "+ kill notify url:%q", cfgKillNotifyUrl)
+	logMain(false, "+ alarm log file:%q", cfgAlarmLogPath)
+	logMain(false, "+ blocked log file:%q", cfgBlockedLogPath)
+	logMain(false, "++++++++++++++++++ end ++++++++++++++++")
 }
 
 func usage() {
@@ -463,17 +538,20 @@ func usage() {
 }
 
 func main() {
+
 	mode = flag.String("m", "tcp", "portguard work mode: tcp or udp")
 	debug = flag.Bool("d", false, "debug mode, print log to stderr")
+	portCacheDuration = flag.Int64("duration", 120, "port cache duration")
+
 	flag.Usage = usage
 	flag.Parse()
 
 	if *debug {
-		normalLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
+		mainLogger = log.New(io.Writer(os.Stderr), "", log.Ldate|log.Lmicroseconds)
 	} else {
 		var err error
-		if normalLogger, err = syslog.NewLogger(syslog.LOG_ERR|syslog.LOG_LOCAL7, log.Ldate|log.Lmicroseconds); err != nil {
-			logNormal(true, "open syslog failed:%s", err.Error())
+		if mainLogger, err = syslog.NewLogger(syslog.LOG_ERR|syslog.LOG_LOCAL7, log.Ldate|log.Lmicroseconds); err != nil {
+			logMain(true, "open syslog failed:%s", err.Error())
 		}
 	}
 
