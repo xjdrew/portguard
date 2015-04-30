@@ -139,7 +139,6 @@ func smartVerify(port int) bool {
 	timestamp := time.Now().Unix()
 	if expire, ok := checkedPortCache[port]; ok {
 		if expire > timestamp {
-			logMain(false, "hit cache: %d", port)
 			return true
 		} else {
 			delete(checkedPortCache, port)
