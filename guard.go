@@ -152,7 +152,12 @@ func smartVerify(port int) bool {
 	return ok
 }
 
-func isExlcudePorts(port int) bool {
+func isExlcudePort(port int) bool {
+	// check port range
+	if port < cfgMinPort || port > cfgMaxPort {
+		return true
+	}
+
 	_, ok := cfgExcludePorts[port]
 	return ok
 }
@@ -274,18 +279,19 @@ func tcpGuard() {
 		port := int(tcp.Destination)
 		ip := remoteAddr.IP
 		ipString := ip.String()
-		// check port range
-		if port < cfgMinPort || port > cfgMaxPort {
-			continue
-		}
 
-		// if blocked before
-		if isBlockedIP(ipString) {
+		// is exclude port
+		if isExlcudePort(port) {
 			continue
 		}
 
 		// check ignore ip
 		if isIgnoredIP(ip) {
+			continue
+		}
+
+		// if blocked before
+		if isBlockedIP(ipString) {
 			continue
 		}
 
@@ -329,18 +335,19 @@ func udpGuard() {
 		log.Printf("%v: %d->%d", remoteAddr, udp.Source, udp.Destination)
 		ip := remoteAddr.IP
 		ipString := ip.String()
-		// check port range
-		if port < cfgMinPort || port > cfgMaxPort {
-			continue
-		}
 
-		// if blocked before
-		if isBlockedIP(ipString) {
+		// is exclude port
+		if isExlcudePort(port) {
 			continue
 		}
 
 		// check ignore ip
 		if isIgnoredIP(ip) {
+			continue
+		}
+
+		// if blocked before
+		if isBlockedIP(ipString) {
 			continue
 		}
 
